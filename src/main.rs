@@ -1,9 +1,10 @@
 mod picker;
-mod stream;
+mod recorder;
+mod writer;
 
 use std::{thread, time::Duration};
 
-use crate::stream::Recorder;
+use crate::recorder::Recorder;
 
 fn main() {
     let content_filter = picker::pick().unwrap();
@@ -11,17 +12,4 @@ fn main() {
     recorder.start();
     thread::sleep(Duration::from_secs(1));
     recorder.stop();
-    let frames: Vec<_> = recorder.frames().collect();
-    println!("{}", frames.len());
-    for (frame, is_keyframe) in frames {
-        unsafe {
-            println!(
-                "{}, {}, {}, {}",
-                frame.presentation_time_stamp().seconds(),
-                frame.decode_time_stamp().seconds(),
-                frame.duration().seconds(),
-                is_keyframe
-            )
-        }
-    }
 }
