@@ -9,7 +9,7 @@ use objc2_screen_capture_kit::{
     SCContentSharingPickerMode, SCContentSharingPickerObserver, SCStream,
 };
 
-/// Either picks a single window or a single display if selected. Returns None if prompt was cancelled by user.
+/// Either picks a single window or a single display if a selection was made. Returns `None` if the user cancels the prompt.
 pub fn pick() -> Option<Retained<SCContentFilter>> {
     // https://github.com/JXA-Cookbook/JXA-Cookbook/issues/27#issuecomment-277517668
     // Initialize Core Graphics. Otherwise, selecting a specific window will crash.

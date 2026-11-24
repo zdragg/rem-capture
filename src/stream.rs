@@ -7,8 +7,10 @@ use block2::RcBlock;
 use objc2::{
     AnyThread, DefinedClass, define_class, msg_send, rc::Retained, runtime::ProtocolObject,
 };
-use objc2_core_foundation::{CFRetained, kCFAllocatorDefault};
-use objc2_core_media::{CMSampleBuffer, kCMVideoCodecType_HEVC};
+use objc2_core_foundation::{
+    CFBoolean, CFDictionary, CFRetained, CFString, CFType, kCFAllocatorDefault,
+};
+use objc2_core_media::{CMSampleBuffer, kCMSampleAttachmentKey_NotSync, kCMVideoCodecType_HEVC};
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCStream, SCStreamConfiguration, SCStreamOutput, SCStreamOutputType,
@@ -57,14 +59,14 @@ impl Recorder {
 
         // Add output handler
         let output = OutputHandler::new(session);
-        if let Err(e) = unsafe {
-            stream.addStreamOutput_type_sampleHandlerQueue_error(
-                ProtocolObject::from_ref(&*output),
-                SCStreamOutputType::Screen,
-                None,
-            )
-        } {
-            panic!("failed to add output to stream: {e}");
+        unsafe {
+            stream
+                .addStreamOutput_type_sampleHandlerQueue_error(
+                    ProtocolObject::from_ref(&*output),
+                    SCStreamOutputType::Screen,
+                    None,
+                )
+                .expect("failed to add output to stream");
         }
 
         Self { stream, output }
@@ -90,13 +92,42 @@ impl Recorder {
         }
     }
 
-    /// Gets encoded frames without blocking.
-    pub fn frames(&self) -> impl Iterator<Item = CFRetained<CMSampleBuffer>> {
-        self.output
-            .ivars()
-            .frame_rx
-            .try_iter()
-            .map(|send_buf| send_buf.0)
+    /// Without blocking, returns an iterator of (buffer, is_keyframe). Each buffer is guaranteed to have one and only one sample.
+    pub fn frames(&self) -> impl Iterator<Item = (CFRetained<CMSampleBuffer>, bool)> {
+        fn is_keyframe(buffer: &CMSampleBuffer) -> bool {
+            let Some(attachments) = (unsafe { buffer.sample_attachments_array(false) }) else {
+                panic!("The CMSampleBuffer should have attachments")
+            };
+
+            // SAFETY: All sample keys are CFStrings. <https://developer.apple.com/documentation/coremedia/sample-attachment-keys>
+            let attachments =
+                unsafe { attachments.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+
+            // The buffer is guaranteed to have one and only one sample
+            // (from the check on the sender side of the channel)
+            // which means that there should be one and only one attachment.
+            let dict = attachments
+                .get(0)
+                .expect("The CMSampleBuffer should have an attachment");
+
+            match dict.get(unsafe { kCMSampleAttachmentKey_NotSync }) {
+                Some(not_sync) => {
+                    // <https://developer.apple.com/documentation/coremedia/kcmsampleattachmentkey_notsync>
+                    let not_keyframe = CFRetained::downcast::<CFBoolean>(not_sync).expect(
+                        "The key kCMSampleAttachmentKey_NotSync should be mapped to a CFBoolean",
+                    );
+                    !not_keyframe.value()
+                }
+                // No NotSync -> yes keyframe
+                None => true,
+            }
+        }
+
+        self.output.ivars().frame_rx.try_iter().map(|send_buf| {
+            let buffer = send_buf.0;
+            let is_keyframe = is_keyframe(&buffer);
+            (buffer, is_keyframe)
+        })
     }
 }
 
@@ -141,13 +172,22 @@ define_class!(
                 move |status: i32, _flags: VTEncodeInfoFlags, frame: *mut CMSampleBuffer| {
                     assert_eq!(status, 0, "frame encoding failed ({status})");
                     let frame = match NonNull::new(frame) {
-                        Some(frame) => SendCMSampleBuffer(unsafe { CFRetained::retain(frame) }),
+                        Some(frame) => unsafe { CFRetained::retain(frame) },
                         None => {
                             // frame was dropped
                             return;
                         }
                     };
-                    frame_tx.send(frame).expect("receiver dropped");
+
+                    let num_samples = unsafe { frame.num_samples() };
+                    assert_eq!(
+                        num_samples, 1,
+                        "expected 1 media sample in CMSampleBuffer, found {num_samples}"
+                    );
+
+                    frame_tx
+                        .send(SendCMSampleBuffer(frame))
+                        .expect("receiver dropped");
                 }
             });
 
