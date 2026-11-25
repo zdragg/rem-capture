@@ -1,7 +1,7 @@
-use std::sync::mpsc::{Receiver, Sender};
-
 use block2::RcBlock;
-use objc2::{AnyThread, define_class, msg_send, rc::Retained, runtime::ProtocolObject};
+use objc2::{
+    AnyThread, DefinedClass, define_class, msg_send, rc::Retained, runtime::ProtocolObject,
+};
 use objc2_core_media::CMSampleBuffer;
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
@@ -9,7 +9,7 @@ use objc2_screen_capture_kit::{
     SCStreamOutputType,
 };
 
-use crate::writer::Writer;
+use crate::writer::{Segments, Writer};
 
 pub struct Recorder {
     stream: Retained<SCStream>,
@@ -45,7 +45,7 @@ impl Recorder {
         let writer = Writer::new(width, height);
 
         // Add output handler
-        let output = StreamOutput::new();
+        let output = StreamOutput::new(writer);
         unsafe {
             stream
                 .addStreamOutput_type_sampleHandlerQueue_error(
@@ -59,32 +59,54 @@ impl Recorder {
         Self { stream, output }
     }
 
-    pub fn start(&self) {
+    pub fn record<'a>(&'a self) -> RecorderGuard<'a> {
+        // Clear out all the separable segments of the previous recording.
+        // This prevents "time-skips", where the segments from before and the new segments
+        // aren't connected in time yet are presented as one continuous video.
+        self.output.ivars().writer.clear();
+
         let block = RcBlock::new(|error: *mut NSError| {
             if let Some(err) = unsafe { error.as_ref() } {
                 panic!("failed to start stream: {}", err);
             }
         });
         unsafe { self.stream.startCaptureWithCompletionHandler(Some(&block)) };
+        RecorderGuard { inner: self }
     }
+}
 
-    pub fn stop(&self) {
+pub struct RecorderGuard<'a> {
+    inner: &'a Recorder,
+}
+
+impl<'a> RecorderGuard<'a> {
+    pub fn cut(&self) -> Option<Segments> {
+        self.inner.output.ivars().writer.cut()
+    }
+}
+
+impl<'a> Drop for RecorderGuard<'a> {
+    fn drop(&mut self) {
         let block = RcBlock::new(|error: *mut NSError| {
             if let Some(err) = unsafe { error.as_ref() } {
                 panic!("failed to stop stream: {}", err);
             }
         });
         unsafe {
-            self.stream.stopCaptureWithCompletionHandler(Some(&block));
+            self.inner
+                .stream
+                .stopCaptureWithCompletionHandler(Some(&block));
         }
+
+        // Clear out all the separable segments of the previous recording.
+        // This prevents "time-skips", where the segments from before and the new segments
+        // aren't connected in time yet are presented as one continuous video.
+        self.inner.output.ivars().writer.clear();
     }
 }
 
-pub struct FragmentedBlock {}
-
 struct OutputHandlerIVars {
-    frame_tx: Sender<FragmentedBlock>,
-    frame_rx: Receiver<FragmentedBlock>,
+    writer: Writer,
 }
 
 define_class!(
@@ -108,23 +130,18 @@ define_class!(
                 "SCStream output type is not Screen"
             );
 
-            let Some(buffer) = (unsafe { sample_buffer.image_buffer() }) else {
-                return;
-            };
-            // println!(
-            //     "{:?}, {:?}, {:?}",
-            //     CVImageBufferGetDisplaySize(&buffer),
-            //     CVImageBufferGetCleanRect(&buffer),
-            //     CVImageBufferGetEncodedSize(&buffer)
-            // );
+            let writer = &self.ivars().writer;
+            if !writer.started() {
+                writer.start(unsafe { sample_buffer.presentation_time_stamp() });
+            }
+            writer.feed(sample_buffer);
         }
     }
 );
 
 impl StreamOutput {
-    fn new() -> Retained<Self> {
-        let (frame_tx, frame_rx) = std::sync::mpsc::channel();
-        let this = Self::alloc().set_ivars(OutputHandlerIVars { frame_tx, frame_rx });
+    fn new(writer: Writer) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(OutputHandlerIVars { writer });
         unsafe { msg_send![super(this), init] }
     }
 }
