@@ -1,39 +1,35 @@
 mod picker;
 mod recorder;
-mod writer;
 
 use std::{
     fs::File,
     io::{BufWriter, Write},
+    path::Path,
     thread,
     time::Duration,
 };
 
-use crate::recorder::Recorder;
+use crate::recorder::{Recorder, writer::SegmentGet};
 
 fn main() {
     let content_filter = picker::pick().unwrap();
-    let recorder = Recorder::new(content_filter);
+    let recorder = Recorder::start(content_filter);
 
-    println!("recording 1 STARTED!");
-    let guard = recorder.record();
     thread::sleep(Duration::from_secs(3));
-    drop(guard);
-    println!("recording 1 STOPPED!");
+    write_to("output1.mp4", recorder.get());
 
-    thread::sleep(Duration::from_secs(1));
+    thread::sleep(Duration::from_secs(3));
+    write_to("output2.mp4", recorder.get());
 
-    println!("recording 2 STARTED!");
-    let guard = recorder.record();
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(3));
+    write_to("output3.mp4", recorder.get());
+}
 
-    if let Some(segments) = guard.cut() {
-        drop(guard);
-        let file = File::create("output.mp4").unwrap();
-        let mut buf_writer = BufWriter::new(file);
+fn write_to(path: impl AsRef<Path>, segments: SegmentGet) {
+    let file = File::create(path.as_ref()).unwrap();
+    let mut buf_writer = BufWriter::new(file);
 
-        for segment in segments.bytes() {
-            buf_writer.write_all(segment).unwrap()
-        }
+    for segment in segments.bytes() {
+        buf_writer.write_all(segment).unwrap()
     }
 }

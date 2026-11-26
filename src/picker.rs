@@ -38,15 +38,15 @@ pub fn pick() -> Option<Retained<SCContentFilter>> {
     filter.map(|f| f.0)
 }
 
-struct SendSCContentFilter(Retained<SCContentFilter>);
+struct PickedSCContentFilter(Retained<SCContentFilter>);
 
 // SAFETY: ScreenCaptureKit probably creates a new SCContentFilter on each did_update(),
 // so it probably doesn't hold a reference to a filter that it already provided.
-unsafe impl Send for SendSCContentFilter {}
+unsafe impl Send for PickedSCContentFilter {}
 
 struct ObserverIVars {
-    tx: Sender<Option<SendSCContentFilter>>,
-    rx: Receiver<Option<SendSCContentFilter>>,
+    tx: Sender<Option<PickedSCContentFilter>>,
+    rx: Receiver<Option<PickedSCContentFilter>>,
 }
 
 impl ObserverIVars {
@@ -82,7 +82,7 @@ define_class!(
             // Print filter address. If it returns different addresses on each did_update(),
             // then ScreenCaptureKit makes a new SCContentFilter every time.
             // println!("{:?}", filter as *const _);
-            let filter = Some(SendSCContentFilter(filter.retain()));
+            let filter = Some(PickedSCContentFilter(filter.retain()));
             self.ivars().tx.send(filter).expect("receiver dropped");
         }
 

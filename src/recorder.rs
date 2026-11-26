@@ -1,3 +1,8 @@
+pub mod encoder;
+pub mod writer;
+
+use std::sync::Arc;
+
 use block2::RcBlock;
 use objc2::{
     AnyThread, DefinedClass, define_class, msg_send, rc::Retained, runtime::ProtocolObject,
@@ -9,16 +14,19 @@ use objc2_screen_capture_kit::{
     SCStreamOutputType,
 };
 
-use crate::writer::{Segments, Writer};
+use crate::recorder::{
+    encoder::Encoder,
+    writer::{SegmentGet, Segments},
+};
 
 pub struct Recorder {
     stream: Retained<SCStream>,
-    output: Retained<StreamOutput>,
+    stream_output: Retained<StreamOutput>,
 }
 
 impl Recorder {
     /// Sets up a stream and output into encoder. (Recorder, width in pixels, height in pixels)
-    pub fn new(content_filter: Retained<SCContentFilter>) -> Self {
+    pub fn start(content_filter: Retained<SCContentFilter>) -> Self {
         let point_pixel_scale = unsafe { content_filter.pointPixelScale() };
         let rect = unsafe { content_filter.contentRect() }.standardize().size;
         // Width and height of the captured video, in pixels
@@ -42,50 +50,39 @@ impl Recorder {
             )
         };
 
-        let writer = Writer::new(width, height);
-
         // Add output handler
-        let output = StreamOutput::new(writer);
+        let stream_output = StreamOutput::new(width, height);
         unsafe {
             stream
                 .addStreamOutput_type_sampleHandlerQueue_error(
-                    ProtocolObject::from_ref(&*output),
+                    ProtocolObject::from_ref(&*stream_output),
                     SCStreamOutputType::Screen,
                     None,
                 )
                 .expect("failed to add output to stream");
         }
 
-        Self { stream, output }
-    }
-
-    pub fn record<'a>(&'a self) -> RecorderGuard<'a> {
-        // Clear out all the separable segments of the previous recording.
-        // This prevents "time-skips", where the segments from before and the new segments
-        // aren't connected in time yet are presented as one continuous video.
-        self.output.ivars().writer.clear();
-
+        // Start stream
         let block = RcBlock::new(|error: *mut NSError| {
             if let Some(err) = unsafe { error.as_ref() } {
                 panic!("failed to start stream: {}", err);
             }
         });
-        unsafe { self.stream.startCaptureWithCompletionHandler(Some(&block)) };
-        RecorderGuard { inner: self }
+        unsafe { stream.startCaptureWithCompletionHandler(Some(&block)) };
+
+        Self {
+            stream,
+            stream_output,
+        }
+    }
+
+    pub fn get(&self) -> SegmentGet {
+        self.stream_output.ivars().encoder.force_segment_output();
+        self.stream_output.ivars().segments_output.get()
     }
 }
 
-pub struct RecorderGuard<'a> {
-    inner: &'a Recorder,
-}
-
-impl<'a> RecorderGuard<'a> {
-    pub fn cut(&self) -> Option<Segments> {
-        self.inner.output.ivars().writer.cut()
-    }
-}
-
-impl<'a> Drop for RecorderGuard<'a> {
+impl Drop for Recorder {
     fn drop(&mut self) {
         let block = RcBlock::new(|error: *mut NSError| {
             if let Some(err) = unsafe { error.as_ref() } {
@@ -93,20 +90,14 @@ impl<'a> Drop for RecorderGuard<'a> {
             }
         });
         unsafe {
-            self.inner
-                .stream
-                .stopCaptureWithCompletionHandler(Some(&block));
+            self.stream.stopCaptureWithCompletionHandler(Some(&block));
         }
-
-        // Clear out all the separable segments of the previous recording.
-        // This prevents "time-skips", where the segments from before and the new segments
-        // aren't connected in time yet are presented as one continuous video.
-        self.inner.output.ivars().writer.clear();
     }
 }
 
 struct OutputHandlerIVars {
-    writer: Writer,
+    encoder: Encoder,
+    segments_output: Arc<Segments>,
 }
 
 define_class!(
@@ -130,18 +121,24 @@ define_class!(
                 "SCStream output type is not Screen"
             );
 
-            let writer = &self.ivars().writer;
-            if !writer.started() {
-                writer.start(unsafe { sample_buffer.presentation_time_stamp() });
-            }
-            writer.feed(sample_buffer);
+            self.ivars().encoder.encode(sample_buffer);
         }
     }
 );
 
 impl StreamOutput {
-    fn new(writer: Writer) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(OutputHandlerIVars { writer });
+    fn new(width: usize, height: usize) -> Retained<Self> {
+        // Channel to send encoded frames FROM the encoder TO the writer
+        let (encoded_frame_tx, encoded_frame_rx) = std::sync::mpsc::channel();
+        let encoder = Encoder::new(width, height, encoded_frame_tx);
+
+        // Spawn writer thread in the background
+        let segments_output = writer::start(encoded_frame_rx);
+
+        let this = Self::alloc().set_ivars(OutputHandlerIVars {
+            encoder,
+            segments_output,
+        });
         unsafe { msg_send![super(this), init] }
     }
 }
