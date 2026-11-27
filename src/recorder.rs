@@ -1,17 +1,25 @@
+//! Pick using Picker, then Stream -> Encoder -> Writer.
+
 mod encoder;
 mod picker;
 mod stream;
 mod writer;
 
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Sender};
+
+use objc2_core_foundation::CFRetained;
+use objc2_core_media::CMSampleBuffer;
 
 use crate::recorder::{stream::Stream, writer::Segments};
 
-pub use crate::recorder::writer::SegmentGet;
-
+/// A recorder.
+///
+/// [`Recorder::start()`] starts the recorder and returns a handle. \
+/// [`Recorder::get()`] returns an iterator of bytes that can be combined into a HEVC MPEG-4 video.
 pub struct Recorder {
-    _stream: Stream,
-    writer_out: Arc<Segments>,
+    _stream: Stream, // kept alive here
+    writer_output: Arc<Segments>,
+    to_encoder: Sender<EncoderCommand>, // Send commands to encoder
 }
 
 impl Recorder {
@@ -27,19 +35,33 @@ impl Recorder {
             (rect.height * f64::from(point_pixel_scale)).round() as usize,
         );
 
-        let (stream_out, encoder_in) = std::sync::mpsc::channel();
-        let (encoder_out, writer_in) = std::sync::mpsc::channel();
-        let stream = Stream::start(content_filter, width, height, stream_out);
-        encoder::spawn(width, height, encoder_in, encoder_out);
-        let writer_out = writer::spawn(writer_in);
+        let (to_encoder, from_stream) = std::sync::mpsc::channel();
+        let (to_writer, from_encoder) = std::sync::mpsc::channel();
+        let stream = Stream::start(content_filter, width, height, to_encoder.clone());
+        encoder::spawn(width, height, from_stream, to_writer);
+        let writer_output = writer::spawn(from_encoder);
 
         Self {
             _stream: stream,
-            writer_out,
+            writer_output,
+            to_encoder,
         }
     }
 
-    pub fn get(&self) -> SegmentGet {
-        self.writer_out.get()
+    pub fn get(&self) -> Vec<impl AsRef<[u8]>> {
+        self.force_keyframe();
+        self.writer_output.get()
+    }
+
+    fn force_keyframe(&self) {
+        self.to_encoder.send(EncoderCommand::ForceKeyframe).unwrap();
     }
 }
+
+enum EncoderCommand {
+    Encode(CFRetained<CMSampleBuffer>),
+    ForceKeyframe,
+}
+
+// SAFETY: The stream probably wouldn't modify the buffer after outputting it
+unsafe impl Send for EncoderCommand {}

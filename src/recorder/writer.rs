@@ -25,16 +25,16 @@ use crate::recorder::encoder::EncodedCMSampleBuffer;
 
 /// Starts the writer thread. The thread will block on the input and output frames
 /// to the returned `Arc<Segments>`.
-pub(super) fn spawn(writer_in: Receiver<EncodedCMSampleBuffer>) -> Arc<Segments> {
+pub(super) fn spawn(to_writer: Receiver<EncodedCMSampleBuffer>) -> Arc<Segments> {
     let segments_output = Arc::new(Segments::new());
-    spawn_thread(writer_in, segments_output.clone());
+    spawn_thread(to_writer, segments_output.clone());
     segments_output
 }
 
-fn spawn_thread(writer_in: Receiver<EncodedCMSampleBuffer>, segments: Arc<Segments>) {
+fn spawn_thread(to_writer: Receiver<EncodedCMSampleBuffer>, segments: Arc<Segments>) {
     std::thread::spawn(move || {
         let writer = Writer::new(segments);
-        while let Ok(frame) = writer_in.recv() {
+        while let Ok(frame) = to_writer.recv() {
             writer.feed(&frame);
         }
         // exit after sender drops
@@ -169,22 +169,30 @@ fn is_keyframe(buffer: &CMSampleBuffer) -> bool {
     }
 }
 
-pub struct SendSyncNSData(Retained<NSData>);
+#[derive(Clone)]
+pub struct SegmentData(Retained<NSData>);
 
-// SAFETY: Segment data probably isn't mutable.
-unsafe impl Send for SendSyncNSData {}
-unsafe impl Sync for SendSyncNSData {}
+// SAFETY: Segment data is probably immutable.
+unsafe impl Send for SegmentData {}
+unsafe impl Sync for SegmentData {}
+
+impl AsRef<[u8]> for SegmentData {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: Segment data is probably immutable.
+        unsafe { self.0.as_bytes_unchecked() }
+    }
+}
 
 pub struct Segments {
-    init_segment: OnceLock<SendSyncNSData>,
-    separable_segments: Mutex<VecDeque<SendSyncNSData>>,
+    init_segment: OnceLock<SegmentData>,
+    separable_segments: Mutex<VecDeque<SegmentData>>,
     generation: AtomicUsize,
     new_segment: Condvar,
 }
 
 impl Segments {
-    /// Gets `SegmentGet`. Returns None if not even the init segment exists yet.
-    pub fn get(&self) -> SegmentGet {
+    /// Returns None if not even the init segment exists yet.
+    pub fn get(&self) -> Vec<impl AsRef<[u8]>> {
         // Wait for the next segment to be outputted
         let mut separable_segments_guard = self.separable_segments.lock().unwrap();
         let current_gen = self.generation.load(Ordering::Relaxed);
@@ -192,22 +200,16 @@ impl Segments {
             separable_segments_guard = self.new_segment.wait(separable_segments_guard).unwrap();
         }
 
-        let separable_segments = separable_segments_guard
-            .iter()
-            .map(|data| data.0.clone())
-            .collect();
-
         let init_segment = self
             .init_segment
             .get()
             .expect("The init segment should exist at this point")
-            .0
-            .clone();
+            .to_owned();
+        let separable_segments = separable_segments_guard.iter().map(|data| data.to_owned());
+        let mut vec = vec![init_segment];
+        vec.extend(separable_segments);
 
-        SegmentGet {
-            init_segment,
-            separable_segments,
-        }
+        vec
     }
 
     fn new() -> Self {
@@ -219,38 +221,18 @@ impl Segments {
         }
     }
 
-    fn insert_init_segment(&self, segment_data: SendSyncNSData) {
+    fn insert_init_segment(&self, segment_data: SegmentData) {
         if let Err(_) = self.init_segment.set(segment_data) {
             panic!("trying to insert init segment when it already exists");
         }
     }
 
-    fn push_separable_segment(&self, segment_data: SendSyncNSData) {
+    fn push_separable_segment(&self, segment_data: SegmentData) {
         let mut guard = self.separable_segments.lock().unwrap();
         (*guard).push_back(segment_data);
         // TODO: take out front, keeping it ~= 30 seconds
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.new_segment.notify_one();
-    }
-}
-
-/// `Segments` but as a non-thread-safe, easy to handle format.
-/// Cloned out of `Segments`.
-pub struct SegmentGet {
-    init_segment: Retained<NSData>,
-    separable_segments: Vec<Retained<NSData>>,
-}
-
-impl SegmentGet {
-    pub fn bytes(&self) -> impl Iterator<Item = &[u8]> {
-        // SAFETY: The segments are probably immutable.
-        let init_bytes = unsafe { self.init_segment.as_bytes_unchecked() };
-        let separable_bytes = self
-            .separable_segments
-            .iter()
-            .map(|segment| unsafe { segment.as_bytes_unchecked() });
-
-        std::iter::once(init_bytes).chain(separable_bytes)
     }
 }
 
@@ -274,7 +256,7 @@ define_class!(
             segment_type: AVAssetSegmentType,
         ) {
             let segments = &self.ivars().segments;
-            let segment_data = SendSyncNSData(segment_data.retain());
+            let segment_data = SegmentData(segment_data.retain());
             match segment_type {
                 AVAssetSegmentType::Initialization => {
                     segments.insert_init_segment(segment_data);

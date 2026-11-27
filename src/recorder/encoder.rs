@@ -1,29 +1,37 @@
 use std::{
+    cell::Cell,
     ffi::c_void,
     ops::Deref,
     ptr::NonNull,
     sync::mpsc::{Receiver, Sender},
 };
 
-use objc2_core_foundation::{CFNumber, CFRetained, kCFAllocatorDefault};
+use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, kCFAllocatorDefault};
 use objc2_core_media::{CMSampleBuffer, kCMTimeInvalid, kCMVideoCodecType_HEVC};
 use objc2_video_toolbox::{
     VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty,
-    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTEncodeFrameOptionKey_ForceKeyFrame,
 };
 
-use crate::recorder::stream::StreamCMSampleBuffer;
+use crate::recorder::EncoderCommand;
 
 pub(super) fn spawn(
     width: usize,
     height: usize,
-    encoder_in: Receiver<StreamCMSampleBuffer>,
-    encoder_out: Sender<EncodedCMSampleBuffer>,
+    from_stream: Receiver<EncoderCommand>,
+    to_writer: Sender<EncodedCMSampleBuffer>,
 ) {
     std::thread::spawn(move || {
-        let writer = Encoder::new(width, height, encoder_out);
-        while let Ok(frame) = encoder_in.recv() {
-            writer.encode(&frame);
+        let writer = Encoder::new(width, height, to_writer);
+        while let Ok(command) = from_stream.recv() {
+            match command {
+                EncoderCommand::Encode(frame) => {
+                    writer.encode(&frame);
+                }
+                EncoderCommand::ForceKeyframe => {
+                    writer.force_keyframe.set(true);
+                }
+            }
         }
         // exit after sender drops
     });
@@ -32,6 +40,7 @@ pub(super) fn spawn(
 pub(super) struct Encoder {
     session: CFRetained<VTCompressionSession>,
     encoder_out_ptr: *mut Sender<EncodedCMSampleBuffer>,
+    force_keyframe: Cell<bool>,
 }
 
 impl Encoder {
@@ -76,6 +85,7 @@ impl Encoder {
         Encoder {
             session,
             encoder_out_ptr,
+            force_keyframe: Cell::new(false),
         }
     }
 
@@ -84,12 +94,24 @@ impl Encoder {
             return;
         };
 
+        // Force next frame to be a keyframe if flag is set
+        let frame_properties = if self.force_keyframe.get() {
+            self.force_keyframe.set(false);
+            let dict = CFDictionary::from_slices(
+                &[unsafe { kVTEncodeFrameOptionKey_ForceKeyFrame }],
+                &[CFBoolean::new(true)],
+            );
+            Some(dict)
+        } else {
+            None
+        };
+
         let status = unsafe {
             self.session.encode_frame(
                 &cv_buffer,
                 cm_buffer.presentation_time_stamp(),
                 cm_buffer.duration(),
-                None,
+                frame_properties.as_ref().map(|dict| dict.as_opaque()),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )

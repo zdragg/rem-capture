@@ -1,16 +1,18 @@
-use std::{ops::Deref, sync::mpsc::Sender};
+use std::sync::mpsc::Sender;
 
 use block2::RcBlock;
 use objc2::{
     AnyThread, DefinedClass, define_class, msg_send, rc::Retained, runtime::ProtocolObject,
 };
-use objc2_core_foundation::{CFRetained, Type};
+use objc2_core_foundation::Type;
 use objc2_core_media::CMSampleBuffer;
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
     SCCaptureResolutionType, SCContentFilter, SCStream, SCStreamConfiguration, SCStreamDelegate,
     SCStreamOutput, SCStreamOutputType,
 };
+
+use crate::recorder::EncoderCommand;
 
 pub(super) struct Stream {
     stream: Retained<SCStream>,
@@ -23,7 +25,7 @@ impl Stream {
         content_filter: Retained<SCContentFilter>,
         width: usize,
         height: usize,
-        stream_out: Sender<StreamCMSampleBuffer>,
+        to_encoder: Sender<EncoderCommand>,
     ) -> Self {
         let stream_config = unsafe { SCStreamConfiguration::new() };
         unsafe {
@@ -42,7 +44,7 @@ impl Stream {
         };
 
         // Add output handler
-        let stream_output_handler = StreamOutputHandler::new(stream_out);
+        let stream_output_handler = StreamOutputHandler::new(to_encoder);
         unsafe {
             stream
                 .addStreamOutput_type_sampleHandlerQueue_error(
@@ -82,20 +84,8 @@ impl Drop for Stream {
     }
 }
 
-pub struct StreamCMSampleBuffer(CFRetained<CMSampleBuffer>);
-
-impl Deref for StreamCMSampleBuffer {
-    type Target = CMSampleBuffer;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-// SAFETY: The stream probably wouldn't modify the buffer after outputting it
-unsafe impl Send for StreamCMSampleBuffer {}
-
 struct StreamOutputHandlerIVars {
-    stream_out: Sender<StreamCMSampleBuffer>,
+    stream_out: Sender<EncoderCommand>,
 }
 
 define_class!(
@@ -121,14 +111,14 @@ define_class!(
 
             self.ivars()
                 .stream_out
-                .send(StreamCMSampleBuffer(sample_buffer.retain()))
+                .send(EncoderCommand::Encode(sample_buffer.retain()))
                 .expect("receiver dropped");
         }
     }
 );
 
 impl StreamOutputHandler {
-    fn new(stream_out: Sender<StreamCMSampleBuffer>) -> Retained<Self> {
+    fn new(stream_out: Sender<EncoderCommand>) -> Retained<Self> {
         let this = Self::alloc().set_ivars(StreamOutputHandlerIVars { stream_out });
         unsafe { msg_send![super(this), init] }
     }
