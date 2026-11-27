@@ -18,7 +18,7 @@ use objc2_av_foundation::{
 };
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFRetained, CFString, CFType};
 use objc2_core_media::{
-    CMSampleBuffer, CMTime, kCMSampleAttachmentKey_NotSync, kCMTimeIndefinite, kCMTimeInvalid,
+    CMSampleBuffer, CMTime, CMTimeFlags, kCMSampleAttachmentKey_NotSync, kCMTimeIndefinite,
 };
 use objc2_foundation::{NSData, NSObject, NSObjectProtocol};
 use objc2_uniform_type_identifiers::UTType;
@@ -248,9 +248,23 @@ impl Segments {
         {
             // pop pop pop
         }
-        drop(guard);
 
         self.generation.fetch_add(1, Ordering::Relaxed);
+
+        // Dropping the guard must happen after the generation increment, or else:
+        // this thread: push segment and drop guard
+        // consumer thread: load generation, finds N
+        // consumer thread: tries to get frame, so acquire guard
+        // consumer thread: checks generation: generation is still N! prepare to sleep
+        // this thread: N += 1 and notify_one()
+        // consumer thread: NOT in sleep yet, so notify_one() does nothing.
+        // consumer thread: goes to sleep until the next segment push wakes it up
+        //
+        // If the guard is dropped after the increment, then the
+        // consumer thread cannot acquire lock before the generation variable
+        // accurately reflects the true generation number.
+        drop(guard);
+
         self.new_segment.notify_one();
     }
 }
@@ -314,11 +328,14 @@ fn find_latest_pts(report: Option<&AVAssetSegmentReport>) -> CMTime {
             continue;
         }
         let earliest_pts = unsafe { report.earliestPresentationTimeStamp() };
-        if earliest_pts == unsafe { kCMTimeInvalid } {
+
+        // using bitflags here because "Do not test a time against [kCMTimeInvalid] using time == invalid"
+        // <https://developer.apple.com/documentation/coremedia/cmtime/invalid>
+        if !earliest_pts.flags.contains(CMTimeFlags::Valid) {
             panic!("segment report should contain valid presentation timestamp");
         }
         let duration = unsafe { report.duration() };
-        if duration == unsafe { kCMTimeInvalid } {
+        if !duration.flags.contains(CMTimeFlags::Valid) {
             panic!("segment report should contain valid duration");
         }
         return unsafe { earliest_pts.add(duration) };
