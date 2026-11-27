@@ -1,30 +1,47 @@
-use std::{cell::Cell, ffi::c_void, ops::Deref, ptr::NonNull, sync::mpsc::Sender};
-
-use objc2_core_foundation::{CFBoolean, CFDictionary, CFRetained, kCFAllocatorDefault};
-use objc2_core_media::{CMSampleBuffer, kCMVideoCodecType_HEVC};
-use objc2_video_toolbox::{
-    VTCompressionSession, VTEncodeInfoFlags, kVTEncodeFrameOptionKey_ForceKeyFrame,
+use std::{
+    ffi::c_void,
+    ops::Deref,
+    ptr::NonNull,
+    sync::mpsc::{Receiver, Sender},
 };
 
-pub struct Encoder {
+use objc2_core_foundation::{CFNumber, CFRetained, kCFAllocatorDefault};
+use objc2_core_media::{CMSampleBuffer, kCMTimeInvalid, kCMVideoCodecType_HEVC};
+use objc2_video_toolbox::{
+    VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty,
+    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+};
+
+use crate::recorder::stream::StreamCMSampleBuffer;
+
+pub(super) fn spawn(
+    width: usize,
+    height: usize,
+    encoder_in: Receiver<StreamCMSampleBuffer>,
+    encoder_out: Sender<EncodedCMSampleBuffer>,
+) {
+    std::thread::spawn(move || {
+        let writer = Encoder::new(width, height, encoder_out);
+        while let Ok(frame) = encoder_in.recv() {
+            writer.encode(&frame);
+        }
+        // exit after sender drops
+    });
+}
+
+pub(super) struct Encoder {
     session: CFRetained<VTCompressionSession>,
-    force_segment_output: Cell<bool>,
+    encoder_out_ptr: *mut Sender<EncodedCMSampleBuffer>,
 }
-
-pub struct EncodedCMSampleBuffer(CFRetained<CMSampleBuffer>);
-
-impl Deref for EncodedCMSampleBuffer {
-    type Target = CMSampleBuffer;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-// SAFETY: CMSampleBuffer probably wouldn't be modified after the encoding completes
-unsafe impl Send for EncodedCMSampleBuffer {}
 
 impl Encoder {
-    pub fn new(width: usize, height: usize, encoded_tx: Sender<EncodedCMSampleBuffer>) -> Self {
+    pub(super) fn new(
+        width: usize,
+        height: usize,
+        encoder_out: Sender<EncodedCMSampleBuffer>,
+    ) -> Self {
+        let encoder_out_ptr = Box::into_raw(Box::new(encoder_out));
+
         // Setup compression session
         let mut session_ptr = std::ptr::null_mut();
         let status = unsafe {
@@ -37,7 +54,7 @@ impl Encoder {
                 None,
                 None,
                 Some(on_encoded),
-                Box::into_raw(Box::new(encoded_tx)).cast(),
+                encoder_out_ptr.cast(),
                 NonNull::from_mut(&mut session_ptr),
             )
         };
@@ -47,32 +64,24 @@ impl Encoder {
         };
         let session = unsafe { CFRetained::from_raw(nonnull_session_ptr) };
 
+        // Maximum 1 second between keyframes
+        unsafe {
+            VTSessionSetProperty(
+                &session,
+                kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+                Some(&CFNumber::new_i32(1)),
+            )
+        };
+
         Encoder {
             session,
-            force_segment_output: Cell::new(false),
+            encoder_out_ptr,
         }
     }
 
-    // Set next frame to a keyframe, then `Writer::feed`: will flush the segment.
-    pub fn force_segment_output(&self) {
-        self.force_segment_output.set(true);
-    }
-
-    pub fn encode(&self, cm_buffer: &CMSampleBuffer) {
+    pub(super) fn encode(&self, cm_buffer: &CMSampleBuffer) {
         let Some(cv_buffer) = (unsafe { cm_buffer.image_buffer() }) else {
             return;
-        };
-
-        // Force next frame to be a keyframe if flag is set
-        let frame_properties = if self.force_segment_output.get() {
-            self.force_segment_output.set(false);
-            let dict = CFDictionary::from_slices(
-                &[unsafe { kVTEncodeFrameOptionKey_ForceKeyFrame }],
-                &[CFBoolean::new(true)],
-            );
-            Some(dict)
-        } else {
-            None
         };
 
         let status = unsafe {
@@ -80,7 +89,7 @@ impl Encoder {
                 &cv_buffer,
                 cm_buffer.presentation_time_stamp(),
                 cm_buffer.duration(),
-                frame_properties.as_ref().map(|dict| dict.as_opaque()),
+                None,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
@@ -89,8 +98,20 @@ impl Encoder {
     }
 }
 
+pub(super) struct EncodedCMSampleBuffer(CFRetained<CMSampleBuffer>);
+
+impl Deref for EncodedCMSampleBuffer {
+    type Target = CMSampleBuffer;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// SAFETY: CMSampleBuffer probably wouldn't be modified after the encoding completes
+unsafe impl Send for EncodedCMSampleBuffer {}
+
 unsafe extern "C-unwind" fn on_encoded(
-    encoded_frame_tx_ptr: *mut c_void,
+    encoder_out_ptr: *mut c_void,
     _frame_refcon: *mut c_void,
     status: i32, // OSStatus is an alias for i32
     _flags: VTEncodeInfoFlags,
@@ -111,7 +132,22 @@ unsafe extern "C-unwind" fn on_encoded(
         "expected 1 media sample in CMSampleBuffer, found {num_samples}"
     );
 
-    let encoded_frame_sender: &Sender<CFRetained<CMSampleBuffer>> =
-        unsafe { &*(encoded_frame_tx_ptr.cast()) };
-    encoded_frame_sender.send(frame).expect("receiver dropped")
+    let encoded_frame_sender: &Sender<EncodedCMSampleBuffer> =
+        unsafe { &*(encoder_out_ptr.cast()) };
+    encoded_frame_sender
+        .send(EncodedCMSampleBuffer(frame))
+        .expect("receiver dropped")
+}
+
+// Runs after `encoder_in` is dropped and the thread finishes.
+// Finishes the compression session so it stops using the encoded frame sender,
+// then drops the encoded frame sender.
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        // Invalid time will emit all pending frames from the session.
+        unsafe { self.session.complete_frames(kCMTimeInvalid) };
+        unsafe { self.session.invalidate() };
+        // SAFETY: pointer is only freed here
+        drop(unsafe { Box::from_raw(self.encoder_out_ptr) });
+    }
 }

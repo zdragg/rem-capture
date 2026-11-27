@@ -1,4 +1,3 @@
-mod picker;
 mod recorder;
 
 use std::{
@@ -9,20 +8,13 @@ use std::{
     time::Duration,
 };
 
-use crate::recorder::{Recorder, writer::SegmentGet};
+use crate::recorder::{Recorder, SegmentGet};
 
 fn main() {
-    let content_filter = picker::pick().unwrap();
-    let recorder = Recorder::start(content_filter);
+    let recorder = Recorder::start();
 
-    thread::sleep(Duration::from_secs(3));
-    write_to("output1.mp4", recorder.get());
-
-    thread::sleep(Duration::from_secs(3));
-    write_to("output2.mp4", recorder.get());
-
-    thread::sleep(Duration::from_secs(3));
-    write_to("output3.mp4", recorder.get());
+    thread::sleep(Duration::from_secs(5));
+    write_to("output.mp4", recorder.get());
 }
 
 fn write_to(path: impl AsRef<Path>, segments: SegmentGet) {

@@ -23,18 +23,18 @@ use objc2_uniform_type_identifiers::UTType;
 
 use crate::recorder::encoder::EncodedCMSampleBuffer;
 
-/// Starts the writer thread. The thread will block on `encoded_frame_rx` and output frames
+/// Starts the writer thread. The thread will block on the input and output frames
 /// to the returned `Arc<Segments>`.
-pub fn start(encoded_frame_rx: Receiver<EncodedCMSampleBuffer>) -> Arc<Segments> {
+pub(super) fn spawn(writer_in: Receiver<EncodedCMSampleBuffer>) -> Arc<Segments> {
     let segments_output = Arc::new(Segments::new());
-    spawn_thread(encoded_frame_rx, segments_output.clone());
+    spawn_thread(writer_in, segments_output.clone());
     segments_output
 }
 
-fn spawn_thread(frames_rx: Receiver<EncodedCMSampleBuffer>, segments: Arc<Segments>) {
+fn spawn_thread(writer_in: Receiver<EncodedCMSampleBuffer>, segments: Arc<Segments>) {
     std::thread::spawn(move || {
         let writer = Writer::new(segments);
-        while let Ok(frame) = frames_rx.recv() {
+        while let Ok(frame) = writer_in.recv() {
             writer.feed(&frame);
         }
         // exit after sender drops
@@ -185,6 +185,7 @@ pub struct Segments {
 impl Segments {
     /// Gets `SegmentGet`. Returns None if not even the init segment exists yet.
     pub fn get(&self) -> SegmentGet {
+        // Wait for the next segment to be outputted
         let mut separable_segments_guard = self.separable_segments.lock().unwrap();
         let current_gen = self.generation.load(Ordering::Relaxed);
         while current_gen == self.generation.load(Ordering::Relaxed) {
