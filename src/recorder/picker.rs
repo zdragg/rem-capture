@@ -10,7 +10,7 @@ use objc2_screen_capture_kit::{
 };
 
 /// Either picks a single window or a single display if a selection was made. Returns `None` if the user cancels the prompt.
-pub fn pick() -> Option<Retained<SCContentFilter>> {
+pub(super) fn pick() -> Option<Retained<SCContentFilter>> {
     // https://github.com/JXA-Cookbook/JXA-Cookbook/issues/27#issuecomment-277517668
     // Initialize Core Graphics. Otherwise, selecting a specific window will crash.
     let _ = objc2_core_graphics::CGMainDisplayID();

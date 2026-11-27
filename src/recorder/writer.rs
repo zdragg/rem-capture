@@ -13,11 +13,13 @@ use objc2::{
     AnyThread, DefinedClass, Message, define_class, msg_send, rc::Retained, runtime::ProtocolObject,
 };
 use objc2_av_foundation::{
-    AVAssetSegmentType, AVAssetWriter, AVAssetWriterDelegate, AVAssetWriterInput, AVFileTypeMPEG4,
-    AVFileTypeProfileMPEG4AppleHLS, AVMediaTypeVideo,
+    AVAssetSegmentReport, AVAssetSegmentType, AVAssetWriter, AVAssetWriterDelegate,
+    AVAssetWriterInput, AVFileTypeMPEG4, AVFileTypeProfileMPEG4AppleHLS, AVMediaTypeVideo,
 };
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFRetained, CFString, CFType};
-use objc2_core_media::{CMSampleBuffer, kCMSampleAttachmentKey_NotSync, kCMTimeIndefinite};
+use objc2_core_media::{
+    CMSampleBuffer, CMTime, kCMSampleAttachmentKey_NotSync, kCMTimeIndefinite, kCMTimeInvalid,
+};
 use objc2_foundation::{NSData, NSObject, NSObjectProtocol};
 use objc2_uniform_type_identifiers::UTType;
 
@@ -25,8 +27,11 @@ use crate::recorder::encoder::EncodedCMSampleBuffer;
 
 /// Starts the writer thread. The thread will block on the input and output frames
 /// to the returned `Arc<Segments>`.
-pub(super) fn spawn(to_writer: Receiver<EncodedCMSampleBuffer>) -> Arc<Segments> {
-    let segments_output = Arc::new(Segments::new());
+pub(super) fn spawn(
+    to_writer: Receiver<EncodedCMSampleBuffer>,
+    length_limit: usize,
+) -> Arc<Segments> {
+    let segments_output = Arc::new(Segments::new(length_limit));
     spawn_thread(to_writer, segments_output.clone());
     segments_output
 }
@@ -170,7 +175,7 @@ fn is_keyframe(buffer: &CMSampleBuffer) -> bool {
 }
 
 #[derive(Clone)]
-pub struct SegmentData(Retained<NSData>);
+struct SegmentData(Retained<NSData>);
 
 // SAFETY: Segment data is probably immutable.
 unsafe impl Send for SegmentData {}
@@ -183,11 +188,13 @@ impl AsRef<[u8]> for SegmentData {
     }
 }
 
-pub struct Segments {
+pub(super) struct Segments {
     init_segment: OnceLock<SegmentData>,
-    separable_segments: Mutex<VecDeque<SegmentData>>,
+    separable_segments: Mutex<VecDeque<(SegmentData, CMTime)>>,
     generation: AtomicUsize,
     new_segment: Condvar,
+    // How much video is kept in memory, in seconds.
+    length_limit: usize,
 }
 
 impl Segments {
@@ -205,19 +212,22 @@ impl Segments {
             .get()
             .expect("The init segment should exist at this point")
             .to_owned();
-        let separable_segments = separable_segments_guard.iter().map(|data| data.to_owned());
+        let separable_segments = separable_segments_guard
+            .iter()
+            .map(|data| data.0.to_owned());
         let mut vec = vec![init_segment];
         vec.extend(separable_segments);
 
         vec
     }
 
-    fn new() -> Self {
+    fn new(length_limit: usize) -> Self {
         Self {
             init_segment: OnceLock::new(),
             separable_segments: Mutex::new(VecDeque::new()),
             generation: AtomicUsize::new(0),
             new_segment: Condvar::new(),
+            length_limit,
         }
     }
 
@@ -227,10 +237,19 @@ impl Segments {
         }
     }
 
-    fn push_separable_segment(&self, segment_data: SegmentData) {
+    fn push_separable_segment(&self, segment_data: SegmentData, latest_pts: CMTime) {
         let mut guard = self.separable_segments.lock().unwrap();
-        (*guard).push_back(segment_data);
-        // TODO: take out front, keeping it ~= 30 seconds
+        guard.push_back((segment_data, latest_pts));
+        let pop_if_pts_smaller_than_this =
+            unsafe { latest_pts.subtract(CMTime::with_seconds(self.length_limit as f64, 1i32)) };
+        while guard
+            .pop_front_if(|frame| unsafe { frame.1.compare(pop_if_pts_smaller_than_this) } < 0)
+            .is_some()
+        {
+            // pop pop pop
+        }
+        drop(guard);
+
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.new_segment.notify_one();
     }
@@ -248,12 +267,13 @@ define_class!(
     unsafe impl NSObjectProtocol for WriterOutput {}
 
     unsafe impl AVAssetWriterDelegate for WriterOutput {
-        #[unsafe(method(assetWriter:didOutputSegmentData:segmentType:))]
+        #[unsafe(method(assetWriter:didOutputSegmentData:segmentType:segmentReport:))]
         fn did_output(
             &self,
             writer: &AVAssetWriter,
             segment_data: &NSData,
             segment_type: AVAssetSegmentType,
+            segment_report: Option<&AVAssetSegmentReport>,
         ) {
             let segments = &self.ivars().segments;
             let segment_data = SegmentData(segment_data.retain());
@@ -262,7 +282,8 @@ define_class!(
                     segments.insert_init_segment(segment_data);
                 }
                 AVAssetSegmentType::Separable => {
-                    segments.push_separable_segment(segment_data);
+                    let latest_pts = find_latest_pts(segment_report);
+                    segments.push_separable_segment(segment_data, latest_pts);
                 }
                 _ => unreachable!(),
             }
@@ -275,4 +296,32 @@ impl WriterOutput {
         let this = Self::alloc().set_ivars(WriterOutputIVars { segments });
         unsafe { msg_send![super(this), init] }
     }
+}
+
+fn find_latest_pts(report: Option<&AVAssetSegmentReport>) -> CMTime {
+    let reports = unsafe {
+        report
+            .expect("separable segments should come with a report")
+            .trackReports()
+    };
+
+    let media_type_video =
+        unsafe { AVMediaTypeVideo.expect("AVMediaTypeVideo should be available") };
+
+    for report in reports {
+        let media_type = unsafe { &*report.mediaType() };
+        if media_type != media_type_video {
+            continue;
+        }
+        let earliest_pts = unsafe { report.earliestPresentationTimeStamp() };
+        if earliest_pts == unsafe { kCMTimeInvalid } {
+            panic!("segment report should contain valid presentation timestamp");
+        }
+        let duration = unsafe { report.duration() };
+        if duration == unsafe { kCMTimeInvalid } {
+            panic!("segment report should contain valid duration");
+        }
+        return unsafe { earliest_pts.add(duration) };
+    }
+    panic!("segment report should contain video track info")
 }

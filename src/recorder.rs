@@ -14,6 +14,9 @@ use crate::recorder::{stream::Stream, writer::Segments};
 
 /// A recorder.
 ///
+/// `length_limit` dictates how much video will be stored in the buffer before
+/// older segments are thrown away
+///
 /// [`Recorder::start()`] starts the recorder and returns a handle. \
 /// [`Recorder::get()`] returns an iterator of bytes that can be combined into a HEVC MPEG-4 video.
 pub struct Recorder {
@@ -23,9 +26,10 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Start recording. Use .get() to get the last x seconds.
-    pub fn start() -> Self {
-        let content_filter = picker::pick().unwrap();
+    /// Start recording. Blocks until the user finishes selection. \
+    /// Returns None if the user cancels the window selection prompt.
+    pub fn start(length_limit: usize) -> Option<Self> {
+        let content_filter = picker::pick()?;
 
         let point_pixel_scale = unsafe { content_filter.pointPixelScale() };
         let rect = unsafe { content_filter.contentRect() }.standardize().size;
@@ -39,13 +43,13 @@ impl Recorder {
         let (to_writer, from_encoder) = std::sync::mpsc::channel();
         let stream = Stream::start(content_filter, width, height, to_encoder.clone());
         encoder::spawn(width, height, from_stream, to_writer);
-        let writer_output = writer::spawn(from_encoder);
+        let writer_output = writer::spawn(from_encoder, length_limit);
 
-        Self {
+        Some(Self {
             _stream: stream,
             writer_output,
             to_encoder,
-        }
+        })
     }
 
     pub fn get(&self) -> Vec<impl AsRef<[u8]>> {

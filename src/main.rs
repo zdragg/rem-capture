@@ -9,11 +9,18 @@ use std::{
 use rem_capture::Recorder;
 
 fn main() {
-    let recorder = Recorder::start();
-
-    thread::sleep(Duration::from_secs(5));
+    let recorder = Recorder::start(5).expect("user shouldn't cancel prompt");
+    thread::sleep(Duration::from_secs(3));
     let bytes = recorder.get();
-    write_to("output.mp4", bytes);
+    write_to("output1.mp4", bytes);
+
+    thread::sleep(Duration::from_secs(3));
+    let bytes = recorder.get();
+    write_to("output2.mp4", bytes);
+
+    thread::sleep(Duration::from_secs(3));
+    let bytes = recorder.get();
+    write_to("output3.mp4", bytes);
 }
 
 fn write_to<'a>(path: impl AsRef<Path>, segments: impl IntoIterator<Item = impl AsRef<[u8]>>) {
